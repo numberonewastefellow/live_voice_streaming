@@ -22,6 +22,168 @@ that uses the **WebSocket** route of the Hugging Face speech-to-speech
 backend instead of the WebRTC SDP proxy. Same load balancer, same
 `/session` handshake, same UI, same orb. Just a different wire.
 
+---
+
+## 📋 Handoff summary — read this first
+
+**What this repo is:** the **voice client + a thin FastAPI proxy**. It captures the mic,
+streams 16 kHz PCM audio over a WebSocket, and plays back the audio it receives.
+
+**What this repo is NOT:** it contains **no AI models** and does **no inference**. VAD, STT,
+the Gemma 4 VLM, and TTS all run on a **separate speech-to-speech (S2S) server you host**.
+
+### Two-hop architecture
+
+```
+   THIS REPO  (client + proxy)                  YOUR S2S SERVER  (host separately)
+ ┌──────────────────────────┐   realtime WS   ┌───────────────────────────────────────────┐
+ │ mic → 16 kHz PCM16 → b64  │ ──────────────► │ VAD → STT → VLM (Gemma 4 Q8) → TTS         │
+ │ noise gate, playback, UI, │                 │                │                            │
+ │ WebSocket client, /api/*  │ ◄────────────── │                └─ internal call → your LLM  │
+ └──────────────────────────┘   24 kHz audio   └───────────────────────────────────────────┘
+   http://localhost:7860        ▲                   e.g. ws://HOST:PORT/v1/realtime
+                                │
+              Client sends only `session.update` = { instructions, voice, tools }.
+              It NEVER sends a model name or an LLM API key — the server owns those.
+```
+
+### What runs where
+
+| Component | In this repo? | Runs on |
+|---|:---:|---|
+| Mic capture, 48→16 kHz resample, PCM16 packing | ✅ | Browser (`worklets/mic-capture.js`) |
+| Noise gate (RMS volume threshold — **not** VAD) | ✅ | Browser |
+| Audio playback (24 kHz), orb UI, WebSocket client | ✅ | Browser |
+| Static hosting + `/api/search` + `/api/session` proxy | ✅ | FastAPI container (`server.py`) |
+| **VAD · STT · VLM (Gemma 4) · TTS** | ❌ | **Your S2S server** |
+
+---
+
+## 🔌 Endpoints to update
+
+Everything a deployer needs to repoint. **Only rows 1–3 live in this repo**; rows 4–6 are on
+the servers you host.
+
+| # | Endpoint / setting | Where to change it | Placeholder / example | Set it to |
+|---|---|---|---|---|
+| 1 | **S2S realtime WebSocket** (direct mode default) | `DEFAULT_S2S_URL` env in [`docker-compose.yml`](docker-compose.yml) — or **Settings → server URL** in the UI | `ws://<s2s-host>:8765/v1/realtime` (`speech-to-speech` default port is **8765**) | Your S2S server's realtime WS. Use `ws://` for plain, `wss://` for TLS. Path is `/v1/realtime`. |
+| 2 | **Load balancer** (optional; LB mode instead of direct) | `LOAD_BALANCER_URL` env | _(empty)_ e.g. `https://…endpoints.huggingface.cloud` | Your LB base URL; the app POSTs `<LB>/session`. Leave empty to use direct mode (row 1). |
+| 3 | **Web search key** (optional tool) | `SERPER_API_KEY` env | _(empty)_ | A [serper.dev](https://serper.dev) key, or leave empty to disable web search. |
+| 4 | **S2S server realtime route** (the contract row 1 dials) | Inside **your S2S server** | `…/v1/realtime` (WebSocket upgrade) | Must accept `input_audio_buffer.append` (16 kHz PCM16) + `session.update`, and emit `response.output_audio.delta` (24 kHz). |
+| 5 | **LLM / Gemma 4 Q8 endpoint** (the VLM stage) | Inside **your S2S server's** config — **NOT this repo** | e.g. `http://5.6.7.8:4567/v1/chat/completions`, model = Gemma 4 Q8, key = none | Your OpenAI-compatible LLM endpoint. The voice client cannot reach this directly — it sits behind the S2S server. |
+| 6 | **STT / TTS / VAD models** | Inside **your S2S server** | Parakeet / Qwen3-TTS / silero (see below) | Whatever models your S2S server loads. The client is model-agnostic. |
+
+> **Client-served API routes** (usually not changed): `GET /api/config`, `GET /api/me`,
+> `POST /api/search`, `POST /api/session`, `GET|DELETE /api/queue/{id}`, `POST /api/queue/end`,
+> `POST /api/session/heartbeat`, `POST /api/session/end`, `/*` static. Defined in
+> [`server.py`](server.py).
+
+### Verify an S2S host speaks the right protocol
+
+```bash
+# 101 Switching Protocols = good (realtime WS). 404/426 = wrong endpoint or a text-only LLM.
+curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZQ==" \
+  http://HOST:PORT/v1/realtime
+```
+
+If that 404s, the host is only a **text LLM** and still needs the VAD+STT+TTS orchestrator
+(the S2S server) in front of it — the voice client cannot talk to a `/v1/chat/completions`
+endpoint directly.
+
+---
+
+## 🧠 Pipeline models (what the demo uses)
+
+Source of truth: [`CONTEXT.md`](CONTEXT.md). Pipeline order: `you speak → VAD → STT → VLM → TTS
+→ orb replies`. All verified live on Hugging Face. **These install on the S2S server you host,
+not on this repo** (this repo needs only `fastapi/uvicorn/httpx/huggingface_hub`).
+
+| Stage | Model (exact id) | Hugging Face repo | Framework / custom code | Install |
+|---|---|---|---|---|
+| **VAD** | `silero-vad` | [snakers4/silero-vad](https://huggingface.co/snakers4/silero-vad) | Small helper lib; PyTorch **or** ONNX | `pip install silero-vad` (or `torch.hub.load('snakers4/silero-vad','silero_vad')`) |
+| **STT** | `nvidia/parakeet-tdt-1.1b` | [nvidia/parakeet-tdt-1.1b](https://huggingface.co/nvidia/parakeet-tdt-1.1b) | **NVIDIA NeMo** (not `transformers`) | `pip install -U "nemo_toolkit[asr]"` |
+| **VLM** | `google/gemma-4-31B-it` (~30.7B, multimodal, 256K ctx) | [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | `transformers` / **vLLM** / **llama.cpp** (for Q8). **Gated** — accept license + HF token | `pip install -U transformers accelerate`, or serve GGUF Q8 via llama.cpp/vLLM |
+| **TTS** | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) | `qwen-tts` package; streaming, style control | `pip install qwen-tts` |
+
+**Voices (TTS):** default `Aiden` (`main.js`). Speakers: `Aiden`, `Ryan`, `Dylan`, `Eric`,
+`Ono_Anna`, `Serena`, `Sohee`, `Uncle_Fu`, `Vivian`. The client sends only the **speaker name**
+in `session.audio.output.voice`.
+
+### ⚠️ STT is Parakeet, NOT Whisper
+
+The demo spec uses **`nvidia/parakeet-tdt-1.1b`** for STT. The `whisper-1` string in the client
+([`ws/s2s-ws-client.js`](ws/s2s-ws-client.js)) is just the **OpenAI Realtime protocol's
+transcription-field label** — a constant, not the model actually loaded. Because **your S2S
+server owns the STT choice** (the client never sends it), you *can* swap in Whisper instead —
+functionally fine, just a different model than the reference demo.
+
+**Whisper variants (for reference):** there is no separate "turbo v3 large" — *turbo is derived
+from large-v3*:
+
+| Model | Repo | Params | Decoder layers |
+|---|---|---|---|
+| `whisper-large-v3-turbo` ← **"turbo v3"** | [openai/whisper-large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | 809M | **4** (pruned) → fast, best for realtime |
+| `whisper-large-v3` (full) | [openai/whisper-large-v3](https://huggingface.co/openai/whisper-large-v3) | 1,550M | 32 → most accurate, slower |
+
+A ready-made orchestrator that wires all four stages behind `/v1/realtime` is Hugging Face's
+open [`speech-to-speech`](https://github.com/huggingface/speech-to-speech) project — the
+reference backend this demo was built against.
+
+> Deeper self-hosting notes: [SELF_HOSTING.md](SELF_HOSTING.md).
+
+---
+
+## 🚀 Hosting the S2S server — `huggingface/speech-to-speech`
+
+**Yes — you can clone/install and host it as-is.** It is the reference orchestrator this demo
+was built against, and its **defaults match this pipeline** (Silero VAD v5, Parakeet TDT STT,
+Qwen3-TTS, OpenAI-compatible LLM). It exposes the exact `/v1/realtime` WebSocket this client
+needs. Repo: <https://github.com/huggingface/speech-to-speech>.
+
+**Install & run (realtime mode is the default):**
+
+```bash
+pip install speech-to-speech          # or: git clone + docker compose up
+speech-to-speech --mode realtime       # serves ws://0.0.0.0:8765/v1/realtime
+# Docker: git clone the repo, then `docker compose up` from its root
+```
+
+**Point its LLM stage at your Gemma 4 Q8** (this is where your hosted LLM plugs in):
+
+```bash
+speech-to-speech --mode realtime \
+  --responses_api_base_url "http://5.6.7.8:4567/v1" \   # your Gemma 4 Q8 OpenAI-compatible endpoint
+  --responses_api_api_key  "none" \                     # your key, or a placeholder if none
+  --model_name             "<your-gemma-4-q8-id>" \     # model id your endpoint serves
+  --stt parakeet-tdt \                                   # STT runs INSIDE this server (loaded locally)
+  --tts qwen3 --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B \
+  --ws_port 8765
+```
+
+Then set this client's **`DEFAULT_S2S_URL=ws://<s2s-host>:8765/v1/realtime`**
+([`docker-compose.yml`](docker-compose.yml)) and it connects.
+
+### ⚠️ Important — which parts are external vs in-process
+
+| Stage | Where it runs under `speech-to-speech` | Your hosted models |
+|---|---|---|
+| **LLM (Gemma 4 Q8)** | **External** — via `--responses_api_base_url` | ✅ Plugs in directly (this is the one external hop) |
+| **STT (Parakeet)** | **In-process** — loaded locally, needs GPU/compute on the S2S box | ⚠️ Your separately-hosted **Whisper is NOT used** unless you configure STT to it; the S2S box loads its own STT |
+| **TTS (Qwen3-TTS)** | **In-process** — loaded locally | — |
+| **VAD (Silero v5)** | **In-process** — loaded locally | — |
+
+So: hosting `speech-to-speech` as-is gives you a **GPU box** that runs VAD+STT+TTS locally and
+calls your Gemma over HTTP. It is **not** "just a proxy" — it needs hardware for the STT/TTS
+models. Hardware: Apple Silicon (MLX, `--local_mac_optimal_settings`), CUDA/Linux, or CPU
+fallback.
+
+> **Two ports, don't conflate them:** the **S2S realtime WebSocket is `:8765`** (what the
+> browser dials); your **Gemma LLM endpoint is a different host/port** (e.g. `:4567/v1`,
+> reached only by the S2S server, never the browser).
+
+---
+
 ## How it works
 
 1. App POSTs `<lb_url>/session` (empty JSON body).
