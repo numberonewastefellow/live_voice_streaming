@@ -12,6 +12,11 @@ hf_oauth: true
 
 # Minimal Conversation App (S2S backend, **WebSocket** transport)
 
+> **Self-hosting / models / requirements → see [SELF_HOSTING.md](SELF_HOSTING.md).**
+> This repo is the **client + proxy only** — it hosts no models. VAD, STT
+> (`nvidia/parakeet-tdt-1.1b`), the Gemma 4 VLM, and TTS
+> (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`) all run on a separate S2S server you host.
+
 Drop-in alternative to [`amir-tfrere/minimal-conversation-app-s2s-backend`](https://huggingface.co/spaces/amir-tfrere/minimal-conversation-app-s2s-backend)
 that uses the **WebSocket** route of the Hugging Face speech-to-speech
 backend instead of the WebRTC SDP proxy. Same load balancer, same
