@@ -1,0 +1,37 @@
+services:
+  hf-realtime-voice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hf-realtime-voice:local
+    container_name: hf-realtime-voice
+    ports:
+      - "7860:7860"
+    environment:
+      # --- All optional. See .env / notes below. ---
+      # Web-search tool (Serper.dev). Leave blank to disable the search tool.
+      SERPER_API_KEY: "${SERPER_API_KEY:-}"
+      # Default speech-to-speech load-balancer URL. Leave BLANK to run in
+      # "direct mode": the browser Settings panel lets you type your own s2s
+      # WebSocket server URL (e.g. http://localhost:8080). The app appends
+      # /v1/realtime and speaks the OpenAI Realtime GA protocol.
+      LOAD_BALANCER_URL: "${LOAD_BALANCER_URL:-}"
+      # Direct-mode default: your own speech-to-speech realtime endpoint. The
+      # browser dials this WebSocket directly (no load balancer, no session
+      # token). Keep the explicit ws:// scheme so a plain (non-TLS) server on a
+      # raw IP is honoured — without it the app forces wss:// for non-localhost
+      # hosts. The realtime path is /v1/realtime; change it if your server mounts
+      # it elsewhere. NOTE: the model (Gemma 4 Q8) and any API key are NOT sent
+      # by this app — the server owns the model; direct mode uses no LLM key.
+      DEFAULT_S2S_URL: "${DEFAULT_S2S_URL:-ws://5.6.7.8:4567/v1/realtime}"
+      # NOTE: metering/queue/HF-login only activate when BOTH LOAD_BALANCER_URL
+      # AND SPACE_ID are set (SPACE_ID is injected only on HF Spaces). Locally
+      # everything runs unmetered, so we intentionally do NOT set SPACE_ID.
+    restart: unless-stopped
+    healthcheck:
+      # /api/config is a cheap, always-on JSON endpoint.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:7860/api/config'); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
