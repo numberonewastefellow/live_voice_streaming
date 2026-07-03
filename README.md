@@ -136,33 +136,24 @@ reference backend this demo was built against.
 
 ## 🚀 Hosting the S2S server — `huggingface/speech-to-speech`
 
-**Yes — you can clone/install and host it as-is.** It is the reference orchestrator this demo
-was built against, and its **defaults match this pipeline** (Silero VAD v5, Parakeet TDT STT,
-Qwen3-TTS, OpenAI-compatible LLM). It exposes the exact `/v1/realtime` WebSocket this client
-needs. Repo: <https://github.com/huggingface/speech-to-speech>.
+**Yes — you can clone/install and host it as-is.** It's the reference orchestrator, and its
+defaults match this exact pipeline: **Silero VAD v5 → Parakeet TDT → OpenAI-compatible LLM →
+Qwen3-TTS**. It serves the `/v1/realtime` WebSocket this client needs, and ships Docker +
+`docker-compose.yml`. Repo: <https://github.com/huggingface/speech-to-speech>.
 
-**Install & run (realtime mode is the default):**
-
-```bash
-pip install speech-to-speech          # or: git clone + docker compose up
-speech-to-speech --mode realtime       # serves ws://0.0.0.0:8765/v1/realtime
-# Docker: git clone the repo, then `docker compose up` from its root
-```
-
-**Point its LLM stage at your Gemma 4 Q8** (this is where your hosted LLM plugs in):
+**Run recipe** (realtime mode is the default; this is where your Gemma 4 Q8 plugs in):
 
 ```bash
+pip install speech-to-speech          # or git clone + docker compose up
 speech-to-speech --mode realtime \
-  --responses_api_base_url "http://5.6.7.8:4567/v1" \   # your Gemma 4 Q8 OpenAI-compatible endpoint
-  --responses_api_api_key  "none" \                     # your key, or a placeholder if none
-  --model_name             "<your-gemma-4-q8-id>" \     # model id your endpoint serves
-  --stt parakeet-tdt \                                   # STT runs INSIDE this server (loaded locally)
-  --tts qwen3 --qwen3_tts_model_name Qwen/Qwen3-TTS-12Hz-1.7B \
-  --ws_port 8765
+  --responses_api_base_url "http://5.6.7.8:4567/v1" \   # ← your Gemma 4 Q8 plugs in HERE
+  --responses_api_api_key  "none" \
+  --model_name "<your-gemma-4-q8-id>" \
+  --stt parakeet-tdt --tts qwen3 --ws_port 8765
 ```
 
-Then set this client's **`DEFAULT_S2S_URL=ws://<s2s-host>:8765/v1/realtime`**
-([`docker-compose.yml`](docker-compose.yml)) and it connects.
+Then point this client at it: **`DEFAULT_S2S_URL=ws://<s2s-host>:8765/v1/realtime`**
+([`docker-compose.yml`](docker-compose.yml)).
 
 ### ⚠️ Important — which parts are external vs in-process
 
